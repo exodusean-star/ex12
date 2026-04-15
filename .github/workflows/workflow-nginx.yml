@@ -1,0 +1,72 @@
+name: Auto-Scaling-Instance-Deployment
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload Config and Assets to S3
+        run: |
+          aws s3 cp ./docker-compose.yaml s3://${{ secrets.S3_BUCKET_NAME }}/docker-compose.yaml
+          aws s3 cp ./nginx/default.conf s3://${{ secrets.S3_BUCKET_NAME }}/conf.d/default.conf
+          aws s3 sync ./nginx/html/ s3://${{ secrets.S3_BUCKET_NAME }}/html/ --delete
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build --no-cache \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            ./nginx
+
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy to EC2 via SSM
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:${{ secrets.EC2_TAG_KEY }},Values=${{ secrets.EC2_TAG_VALUE }}" \
+            --parameters 'commands=[
+              "mkdir -p /home/ec2-user/nginx/conf.d /home/ec2-user/nginx/html /home/ec2-user/nginx/logs",
+              "chown -R ec2-user:ec2-user /home/ec2-user/nginx",
+
+              "aws s3 cp s3://${{ secrets.S3_BUCKET_NAME }}/docker-compose.yaml /home/ec2-user/docker-compose.yaml",
+              "aws s3 cp s3://${{ secrets.S3_BUCKET_NAME }}/conf.d/default.conf /home/ec2-user/nginx/conf.d/default.conf",
+              "aws s3 sync s3://${{ secrets.S3_BUCKET_NAME }}/html/ /home/ec2-user/nginx/html/ --delete",
+
+              "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}",
+
+              "bash -c '\''export ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }} ECR_REPO=${{ secrets.ECR_REPOSITORY }} IMAGE_TAG=${{ github.sha }} && cd /home/ec2-user && docker-compose pull'\''",
+              "bash -c '\''export ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }} ECR_REPO=${{ secrets.ECR_REPOSITORY }} IMAGE_TAG=${{ github.sha }} && cd /home/ec2-user && docker-compose up -d --remove-orphans'\''",
+
+              "docker image prune -af"
+            ]' \
+            --comment "Deploy Nginx container on EC2 using SSM" \
+            --timeout-seconds 600 \
+            --region ${{ secrets.AWS_REGION }}
